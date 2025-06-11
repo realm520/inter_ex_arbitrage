@@ -19,73 +19,69 @@ load_dotenv(dotenv_path=env_path)
 
 class Config:
     """
-    A class to manage configuration for the arbitrage bot.
-    It loads settings from a YAML file and integrates them with
-    API credentials from environment variables.
+    Manages application configuration by loading from a YAML file
+    and environment variables. Allows nested access to config values
+    using dot notation.
     """
     def __init__(self, config_path: str = 'config.yaml'):
-        # Construct the full path to the config file relative to the project root
-        self.config_file_path = Path(__file__).parent.parent.parent.parent / config_path
-        if not self.config_file_path.is_file():
-            raise FileNotFoundError(f"Configuration file not found at: {self.config_file_path}")
+        # Load environment variables from .env file
+        load_dotenv()
 
-        # Load the base configuration from the YAML file
-        with open(self.config_file_path, 'r') as f:
-            self._config = yaml.safe_load(f)
+        # Load base configuration from YAML
+        config_file = Path(config_path)
+        if not config_file.exists():
+            raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
-        # Inject API credentials from environment variables into the config
-        self._load_api_credentials()
+        with open(config_file, 'r') as f:
+            yaml_config = yaml.safe_load(f)
 
-    def _load_api_credentials(self):
+        # Recursively set attributes
+        self._set_attributes(yaml_config)
+
+        # Override with environment variables if they exist
+        self._override_with_env_vars()
+
+    def _set_attributes(self, data: dict):
         """
-        Private method to load API credentials from environment variables
-        for all exchanges defined in the config file.
+        Recursively sets attributes on the Config object.
+        Nested dictionaries are converted to new Config instances.
         """
-        if 'exchanges' in self._config:
-            for exchange_name in self._config['exchanges']:
-                api_key_var = f"{exchange_name.upper()}_API_KEY"
-                api_secret_var = f"{exchange_name.upper()}_API_SECRET"
-                
-                api_key = os.getenv(api_key_var)
-                api_secret = os.getenv(api_secret_var)
-                
-                # Store the credentials in the exchange's config dictionary
-                self._config['exchanges'][exchange_name]['api_key'] = api_key
-                self._config['exchanges'][exchange_name]['api_secret'] = api_secret
+        for key, value in data.items():
+            if isinstance(value, dict):
+                # If the value is a dictionary, create a new "sub-Config"
+                setattr(self, key, self._make_nested_config(value))
+            else:
+                setattr(self, key, value)
+
+    def _make_nested_config(self, data: dict):
+        """Helper to create a nested Config object."""
+        nested_config = Config.__new__(Config) # Create a new instance without calling __init__
+        nested_config._set_attributes(data)
+        return nested_config
+
+    def _override_with_env_vars(self):
+        """
+        Overrides YAML config with environment variables.
+        Specifically looks for API keys and secrets for exchanges.
+        """
+        if hasattr(self, 'exchanges'):
+            # self.exchanges is a Config object, but .items() will work
+            for exchange_name, exchange_config in self.exchanges.items():
+                api_key_env = f"{exchange_name.upper()}_API_KEY"
+                secret_env = f"{exchange_name.upper()}_SECRET"
+
+                if os.getenv(api_key_env):
+                    setattr(exchange_config, 'api_key', os.getenv(api_key_env))
+                if os.getenv(secret_env):
+                    setattr(exchange_config, 'secret', os.getenv(secret_env))
 
     def get(self, key, default=None):
-        """
-        Retrieves a configuration value for a given key.
-        """
-        return self._config.get(key, default)
+        """Provides a .get() method, similar to a dictionary."""
+        return getattr(self, key, default)
 
-    @property
-    def exchanges(self) -> dict:
-        """
-        Returns the configuration for all exchanges.
-        """
-        return self.get('exchanges', {})
+    def items(self):
+        """Allows iterating over key-value pairs, like a dictionary."""
+        return vars(self).items()
 
-    @property
-    def arbitrage(self) -> dict:
-        """
-        Returns the arbitrage parameters.
-        """
-        return self.get('arbitrage', {})
-        
-    @property
-    def risk(self) -> dict:
-        """
-        Returns the risk management parameters.
-        """
-        return self.get('risk', {})
-
-    @property
-    def logging(self) -> dict:
-        """
-        Returns the logging configuration.
-        """
-        return self.get('logging', {})
-
-# Create a global config instance to be used throughout the application
+# Singleton instance to be used across the application
 config = Config() 

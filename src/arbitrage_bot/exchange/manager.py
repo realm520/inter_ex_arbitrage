@@ -1,88 +1,100 @@
 import asyncio
-import ccxt.pro as ccxtpro
-from typing import Dict
+import ccxt.pro as ccxt
+from typing import Dict, Optional
+from loguru import logger
+import orjson
 
 from arbitrage_bot.config.settings import config
 
 class ExchangeManager:
-    """
-    Manages connections to multiple exchanges using ccxt.pro.
-    Initializes and holds exchange instances for use throughout the application.
-    """
+    """Manages connections to multiple cryptocurrency exchanges."""
 
-    def __init__(self):
-        self._config = config
-        self.exchanges: Dict[str, ccxtpro.Exchange] = {}
+    def __init__(self, app_config: config, error_handler: "ErrorHandler"):
+        self._config = app_config
+        self.error_handler = error_handler
+        self.exchanges: Dict[str, ccxt.Exchange] = {}
 
     async def initialize_exchanges(self):
-        """
-        Initializes connections to all exchanges enabled in the configuration.
-        It tests the connection by loading markets for each exchange.
-        """
-        enabled_exchanges = [
-            (name, conf) for name, conf in self._config.exchanges.items() if conf.get('enabled')
-        ]
-
-        # Create tasks for each exchange connection
-        connection_tasks = [
-            self._connect_to_exchange(name, conf) for name, conf in enabled_exchanges
-        ]
+        """Initializes and connects to all enabled exchanges from the config."""
+        logger.info("Initializing exchange connections...")
         
-        # Run connection tasks concurrently
-        results = await asyncio.gather(*connection_tasks, return_exceptions=True)
+        enabled_exchanges = []
+        if hasattr(self._config, 'exchanges'):
+             enabled_exchanges = [name for name, conf in self._config.exchanges.items() if conf.get('enabled')]
 
-        for name, instance in results:
-            if instance:
-                self.exchanges[name] = instance
-                print(f"Successfully connected to {name} and loaded markets.")
+        if not enabled_exchanges:
+            logger.warning("No exchanges are enabled in the configuration file.")
+            return
+        
+        tasks = [self.add_exchange(name) for name in enabled_exchanges]
+        await asyncio.gather(*tasks)
+        logger.info(f"Finished exchange initialization. {len(self.exchanges)} connections active.")
 
-    async def _connect_to_exchange(self, name: str, conf: dict) -> (str, ccxtpro.Exchange or None):
+    async def add_exchange(self, exchange_name: str):
         """
-        A helper method to connect to a single exchange.
-        Returns a tuple of (exchange_name, exchange_instance) or (exchange_name, None) on failure.
+        Connects to a single exchange and adds it to the manager.
         """
+        if exchange_name in self.exchanges:
+            logger.warning(f"Exchange '{exchange_name}' is already connected.")
+            return
+
+        exchange_config = self._config.exchanges.get(exchange_name)
+        if not exchange_config:
+            logger.error(f"Configuration for exchange '{exchange_name}' not found.")
+            return
+
+        # Check circuit breaker before attempting to connect
+        if self.error_handler.is_circuit_open(exchange_name):
+            return
+
+        exchange = None
         try:
-            exchange_class = getattr(ccxtpro, name)
+            exchange_class = getattr(ccxt, exchange_name)
+            exchange = exchange_class({
+                'apiKey': exchange_config.get('api_key'),
+                'secret': exchange_config.get('secret'),
+                'password': exchange_config.get('password'), # For exchanges like KuCoin
+                'options': {
+                    'defaultType': 'spot',
+                },
+            })
+            # --- Performance Optimization ---
+            exchange.json = orjson.dumps
+            exchange.unjson = orjson.loads
+            # ------------------------------
             
-            # Use a dictionary for exchange settings to avoid errors with None values
-            exchange_settings = {
-                'apiKey': conf.get('api_key'),
-                'secret': conf.get('api_secret'),
-                'enableRateLimit': True,
-            }
-            
-            instance = exchange_class(exchange_settings)
-            
-            # Test the connection by loading markets. This is a crucial step.
-            await instance.load_markets()
-            
-            return name, instance
-
-        except (AttributeError, ccxtpro.base.errors.AuthenticationError) as e:
-            print(f"Error connecting to {name}: {e}")
-            print(f"Please ensure '{name}' is a valid ccxt exchange and your API keys are correct.")
+            # Test connectivity by loading markets
+            await exchange.load_markets()
+            self.exchanges[exchange_name] = exchange
+            logger.success(f"Successfully connected to {exchange_name}.")
+            self.error_handler.reset_error(exchange_name) # Reset error count on success
+        except AttributeError:
+             logger.error(f"Exchange '{exchange_name}' is not supported by ccxt.pro.")
         except Exception as e:
-            print(f"An unexpected error occurred while connecting to {name}: {e}")
+            logger.error(f"Failed to connect to {exchange_name}: {e}")
+            self.error_handler.record_error(exchange_name) # Record error
+            if exchange:
+                # Ensure the session is closed if the instance was created but connection failed
+                await exchange.close()
 
-        return name, None
-
-    def get_exchange(self, name: str) -> ccxtpro.Exchange or None:
-        """
-        Retrieves a connected exchange instance by its name.
-        """
-        return self.exchanges.get(name)
+    def get_exchange(self, exchange_name: str) -> Optional[ccxt.Exchange]:
+        """Retrieves a connected exchange instance by its name."""
+        exchange = self.exchanges.get(exchange_name)
+        if exchange is None:
+            logger.warning(f"Attempted to get a non-existent or disconnected exchange: {exchange_name}")
+        return exchange
 
     async def close_all(self):
-        """
-        Closes all active exchange connections gracefully.
-        """
-        print("Closing all exchange connections...")
-        close_tasks = [
-            exchange.close() for exchange in self.exchanges.values() if hasattr(exchange, 'close')
-        ]
-        await asyncio.gather(*close_tasks, return_exceptions=True)
+        """Closes all active exchange connections."""
+        logger.info("Closing all exchange connections...")
+        tasks = [exchange.close() for exchange in self.exchanges.values()]
+        await asyncio.gather(*tasks, return_exceptions=True)
         self.exchanges.clear()
-        print("All connections closed.")
+        logger.info("All exchange connections have been closed.")
 
-# A single instance to be used across the application
-exchange_manager = ExchangeManager() 
+    def set_error_handler(self, error_handler: "ErrorHandler"):
+        """Sets the error handler after initialization."""
+        self.error_handler = error_handler
+
+# Singleton instance
+exchange_manager = ExchangeManager(config, None) 

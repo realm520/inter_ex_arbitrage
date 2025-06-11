@@ -5,13 +5,13 @@ exchanges:
     enabled: true
     # API credentials will be loaded from environment variables
     # e.g., BINANCE_API_KEY, BINANCE_API_SECRET
-    trading_pairs:
+    symbols:
       - "BTC/USDT"
       - "ETH/USDT"
   kraken:
     enabled: true
     # e.g., KRAKEN_API_KEY, KRAKEN_API_SECRET
-    trading_pairs:
+    symbols:
       - "BTC/USDT"
       - "ETH/USDT"
   # Add other exchanges here following the same structure
@@ -34,6 +34,11 @@ risk:
   # The maximum number of concurrent open trades
   max_open_trades: 3
 
+risk_management:
+  max_open_trades: 5
+  emergency_stop_loss_pct: 10.0
+  pnl_file: "pnl_report.json"
+
 logging:
-  level: "INFO" # e.g., DEBUG, INFO, WARNING, ERROR
+  level: "DEBUG" # Can be DEBUG, TRACE, INFO, WARNING, ERROR, CRITICAL
   file: "arbitrage_bot.log" 

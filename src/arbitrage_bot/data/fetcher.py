@@ -1,7 +1,11 @@
 import asyncio
-from typing import Dict, List
+import ccxt.pro
+from loguru import logger
+from typing import Dict, List, Any
+from collections import defaultdict
 
 from arbitrage_bot.exchange.manager import ExchangeManager
+from arbitrage_bot.utils.error_handler import ErrorHandler
 
 class DataFetcher:
     """
@@ -9,77 +13,89 @@ class DataFetcher:
     using WebSocket streams provided by ccxt.pro.
     """
 
-    def __init__(self, exchange_manager: ExchangeManager):
+    def __init__(self, exchange_manager: ExchangeManager, error_handler: ErrorHandler):
         self.exchange_manager = exchange_manager
-        # A nested dictionary to store order books: {exchange_name: {symbol: order_book}}
-        self.order_books: Dict[str, Dict[str, Dict]] = {}
-        self._monitoring_tasks: List[asyncio.Task] = []
+        self.error_handler = error_handler
+        # A nested defaultdict to store order books: {exchange_name: {symbol: order_book}}
+        # This prevents KeyErrors when accessing nested dictionaries for the first time.
+        self._order_books: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        self.active_symbols = self._get_active_symbols()
+        self._monitoring_task = None
+        self._is_monitoring = False
+
+    def _get_active_symbols(self) -> Dict[str, List[str]]:
+        active_symbols = defaultdict(list)
+        for exchange_name, settings in self.exchange_manager._config.exchanges.items():
+            if settings.get('enabled', False):
+                active_symbols[exchange_name] = settings.get('symbols', [])
+        return active_symbols
+
+    async def _watch_order_book(self, exchange_name: str, symbol: str):
+        exchange = self.exchange_manager.exchanges[exchange_name]
+        logger.info(f"Subscribing to order book for {symbol} on {exchange_name}")
+        
+        component_id = f"{exchange_name}_{symbol}_orderbook"
+
+        while self._is_monitoring:
+            if self.error_handler.is_circuit_open(component_id):
+                await asyncio.sleep(10) # Wait longer if circuit is open
+                continue
+
+            try:
+                order_book = await exchange.watch_order_book(symbol)
+                self._order_books[exchange_name][symbol] = order_book
+                logger.trace(f"Received order book update for {symbol} on {exchange_name}")
+                self.error_handler.reset_error(component_id) # Reset on success
+            except Exception as e:
+                logger.error(f"Error watching order book for {symbol} on {exchange_name}: {e}")
+                self.error_handler.record_error(component_id)
+                delay = await self.error_handler.get_backoff_delay(component_id)
+                logger.info(f"Backing off for {delay:.2f}s before retrying {component_id}...")
+                await asyncio.sleep(delay)
 
     def start_monitoring(self):
-        """
-        Starts the monitoring tasks for all trading pairs specified in the config
-        for all enabled and connected exchanges.
-        """
-        print("Starting data monitoring...")
-        for exchange_name, exchange in self.exchange_manager.exchanges.items():
-            # Get the trading pairs for the current exchange from the config
-            trading_pairs = self.exchange_manager._config.exchanges[exchange_name].get('trading_pairs', [])
-            
-            for symbol in trading_pairs:
-                if symbol in exchange.markets:
-                    # Create a background task for each symbol on each exchange
-                    task = asyncio.create_task(self._watch_order_book_loop(exchange_name, symbol))
-                    self._monitoring_tasks.append(task)
-                else:
-                    print(f"Warning: Symbol {symbol} not found in {exchange_name}. Skipping.")
-        
-        if not self._monitoring_tasks:
-            print("No monitoring tasks were started. Check your config for enabled exchanges and trading pairs.")
-
-    async def _watch_order_book_loop(self, exchange_name: str, symbol: str):
-        """
-        The core loop that continuously watches the order book for a specific symbol on an exchange.
-        This method is designed to run indefinitely as a background task.
-        """
-        exchange = self.exchange_manager.get_exchange(exchange_name)
-        if not exchange:
+        if self._monitoring_task:
+            logger.warning("Monitoring is already running.")
             return
 
-        print(f"Starting order book monitoring for {symbol} on {exchange_name}...")
-        while True:
-            try:
-                # ccxt.pro's watch_order_book fetches the full order book on the first call,
-                # and then receives incremental updates via WebSocket.
-                order_book = await exchange.watch_order_book(symbol)
-                
-                # Store the latest order book data
-                if exchange_name not in self.order_books:
-                    self.order_books[exchange_name] = {}
-                self.order_books[exchange_name][symbol] = order_book
-                
-                # Optional: Print a small part of the data to show it's working
-                # best_bid = order_book['bids'][0][0] if order_book['bids'] else 'N/A'
-                # best_ask = order_book['asks'][0][0] if order_book['asks'] else 'N/A'
-                # print(f"[{exchange_name} - {symbol}] Best Bid: {best_bid}, Best Ask: {best_ask}")
+        self._is_monitoring = True
+        tasks = []
+        for exchange_name, symbols in self.active_symbols.items():
+            for symbol in symbols:
+                tasks.append(self._watch_order_book(exchange_name, symbol))
+        
+        self._monitoring_task = asyncio.gather(*tasks)
+        logger.info("Started data fetcher monitoring.")
 
-            except Exception as e:
-                print(f"Error watching order book for {symbol} on {exchange_name}: {e}")
-                # In a real application, you'd want more robust reconnection logic.
-                # For now, we'll wait and try again.
-                await asyncio.sleep(5)
+    async def stop_monitoring(self):
+        """Stops the monitoring task gracefully."""
+        logger.debug("Attempting to stop monitoring...")
+        if not self._is_monitoring or not self._monitoring_task:
+            logger.debug("Monitoring was not active or task does not exist.")
+            return
+            
+        self._is_monitoring = False
+        
+        if self._monitoring_task.done():
+            logger.info("Monitoring task was already done.")
+            return
 
-    def stop_monitoring(self):
-        """
-        Stops all background monitoring tasks.
-        """
-        print("Stopping all data monitoring tasks...")
-        for task in self._monitoring_tasks:
-            task.cancel()
-        self._monitoring_tasks.clear()
-        print("Monitoring stopped.")
+        logger.debug(f"Cancelling monitoring task {id(self._monitoring_task)}...")
+        self._monitoring_task.cancel()
+        
+        try:
+            await self._monitoring_task
+            logger.debug("Monitoring task awaited successfully after cancel.")
+        except asyncio.CancelledError:
+            logger.debug("Successfully caught expected CancelledError for monitoring task.")
+        finally:
+            self._monitoring_task = None
+            logger.info("Stopped data fetcher monitoring.")
 
-    def get_order_book(self, exchange_name: str, symbol: str) -> Dict or None:
-        """
-        Retrieves the latest order book for a given exchange and symbol.
-        """
-        return self.order_books.get(exchange_name, {}).get(symbol) 
+    def get_order_book(self, exchange_name: str, symbol: str) -> Dict[str, Any]:
+        """Returns the latest order book for a specific exchange and symbol."""
+        return self._order_books.get(exchange_name, {}).get(symbol)
+
+    def get_all_order_books(self) -> Dict[str, Dict[str, Any]]:
+        """Returns all currently stored order books."""
+        return self._order_books 
