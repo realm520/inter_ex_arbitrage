@@ -1,41 +1,33 @@
-import time
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
-from loguru import logger
+from __future__ import annotations
 import itertools
+import time
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional
 
-from arbitrage_bot.data.fetcher import DataFetcher
+from loguru import logger
+
 from arbitrage_bot.config.settings import config
-from arbitrage_bot.exchange.manager import exchange_manager
-from .costs import CostCalculator
+from arbitrage_bot.arbitrage.costs import CostCalculator
+from arbitrage_bot.model import Opportunity
 
-@dataclass
-class ArbitrageOpportunity:
-    """
-    Represents a potential arbitrage opportunity found by the scanner.
-    """
-    symbol: str
-    buy_exchange: str
-    sell_exchange: str
-    buy_price: float
-    sell_price: float
-    gross_profit_pct: float
-    net_profit_pct: float
-    timestamp: float = time.time()
+if TYPE_CHECKING:
+    from arbitrage_bot.data.fetcher import DataFetcher
+    from arbitrage_bot.exchange.manager import ExchangeManager
 
 class ArbitrageScanner:
     """
     Scans for arbitrage opportunities across multiple exchanges
     by analyzing the real-time order book data.
     """
-    def __init__(self, data_fetcher: DataFetcher):
+    def __init__(self, data_fetcher: DataFetcher, exchange_manager: ExchangeManager):
         self.data_fetcher = data_fetcher
-        self.min_profit_threshold = config.arbitrage.get('min_profit_threshold', 0.1)
+        arbitrage_config = config.get("arbitrage", {})
+        self.min_profit_threshold = arbitrage_config.get('min_profit_threshold', 0.1)
         # Initialize the cost calculator
         self.cost_calculator = CostCalculator(exchange_manager)
 
-    def scan(self) -> List[ArbitrageOpportunity]:
+    def scan(self) -> Optional[Opportunity]:
         """
         Scans all available order books and identifies potential arbitrage opportunities.
         """
@@ -44,9 +36,14 @@ class ArbitrageScanner:
         # 1. Group order books by symbol
         order_books_by_symbol = defaultdict(dict)
         all_order_books = self.data_fetcher.get_all_order_books()
+        if not all_order_books:
+            logger.warning("[Scan] No order book data available to scan.")
+            return None
+
         for exchange_name, symbols in all_order_books.items():
             for symbol, order_book in symbols.items():
-                order_books_by_symbol[symbol][exchange_name] = order_book
+                if order_book and order_book.get('bids') and order_book.get('asks'):
+                     order_books_by_symbol[symbol][exchange_name] = order_book
 
         # 2. Iterate through each symbol and compare exchanges
         for symbol, exchanges in order_books_by_symbol.items():
@@ -55,9 +52,14 @@ class ArbitrageScanner:
 
             # Find the best ask (lowest price to buy) and best bid (highest price to sell) across all exchanges for this symbol
             prices = self._get_best_prices_for_symbol(exchanges)
-            
-            best_bid_exchange, best_bid = max(prices['bids'].items(), key=lambda item: item[1], default=(None, None))
-            best_ask_exchange, best_ask = min(prices['asks'].items(), key=lambda item: item[1], default=(None, None))
+            if not prices['bids'] or not prices['asks']:
+                continue
+
+            best_bid_exchange, best_bid = max(prices['bids'].items(), key=lambda item: item[1])
+            best_ask_exchange, best_ask = min(prices['asks'].items(), key=lambda item: item[1])
+
+            if not all([best_bid_exchange, best_bid, best_ask_exchange, best_ask]):
+                continue
 
             if best_ask_exchange == best_bid_exchange:
                 # Cannot arbitrage on the same exchange
@@ -78,9 +80,10 @@ class ArbitrageScanner:
                 # --- Display all positive-spread calculations for debugging/visibility ---
                 logger.trace(f"[Scan] {symbol}: Buy on {best_ask_exchange}@{best_ask}, Sell on {best_bid_exchange}@{best_bid}. Gross: {gross_profit_pct:.4f}%, Net: {net_profit_pct:.4f}%")
 
-                # Check if the NET profit meets our minimum threshold
                 if net_profit_pct >= self.min_profit_threshold:
-                    opportunity = ArbitrageOpportunity(
+                    # For now, let's just return the best single opportunity
+                    # In a real scenario, you might want to handle multiple opportunities
+                    return Opportunity(
                         symbol=symbol,
                         buy_exchange=best_ask_exchange,
                         sell_exchange=best_bid_exchange,
@@ -89,21 +92,10 @@ class ArbitrageScanner:
                         gross_profit_pct=gross_profit_pct,
                         net_profit_pct=net_profit_pct,
                     )
-                    opportunities.append(opportunity)
         
-        if opportunities:
-            # Sort by net profit
-            opportunities.sort(key=lambda o: o.net_profit_pct, reverse=True)
-        else:
-            # More detailed logging for debugging when no opportunities are found
-            if self.data_fetcher.get_all_order_books():
-                logger.trace("[Scan] No profitable opportunities found in this cycle.")
-            else:
-                logger.warning("[Scan] No order book data available to scan.")
+        return None
 
-        return opportunities
-
-    def _get_best_prices_for_symbol(self, symbol_order_books: Dict) -> Dict:
+    def _get_best_prices_for_symbol(self, symbol_order_books: dict) -> dict:
         """
         Retrieves the best bid and ask for a given symbol from pre-fetched order books.
         

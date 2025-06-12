@@ -22,35 +22,42 @@ def main():
     )
     args = parser.parse_args()
 
-    logger.info("Starting arbitrage bot...")
+    # Setup logging first
+    setup_logging()
+    
+    logger.info("Initializing arbitrage bot...")
     if args.paper:
         logger.info("Running in paper trading mode.")
-
-    setup_logging()
-
-    bot = ArbitrageBot(paper_mode=args.paper)
-
+    
+    # Get the asyncio event loop
     loop = asyncio.get_event_loop()
 
-    # --- Graceful Shutdown Logic ---
-    shutdown_signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+    # The main async function that creates and runs the bot
+    async def async_main():
+        bot = await ArbitrageBot.create(paper_mode=args.paper)
 
-    async def shutdown(sig: signal.Signals):
-        logger.warning(f"Received exit signal {sig.name}...")
-        await bot.shutdown()
-        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("All tasks cancelled, stopping event loop.")
-        loop.stop()
+        # --- Graceful Shutdown Logic ---
+        shutdown_signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
 
-    for s in shutdown_signals:
-        loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown(s)))
-    # ---------------------------------
+        async def shutdown(sig: signal.Signals):
+            logger.warning(f"Received exit signal {sig.name}...")
+            await bot.shutdown()
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info("All tasks cancelled, stopping event loop.")
+            loop.stop()
 
+        for s in shutdown_signals:
+            loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown(s)))
+        # ---------------------------------
+
+        await bot.run()
+
+    # Run the main async function until it's stopped
     try:
-        loop.create_task(bot.run())
+        loop.create_task(async_main())
         loop.run_forever()
     finally:
         logger.info("Event loop stopped. Closing.")

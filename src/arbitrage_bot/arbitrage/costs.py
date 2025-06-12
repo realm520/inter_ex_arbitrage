@@ -1,5 +1,11 @@
-from typing import Dict
-from arbitrage_bot.exchange.manager import ExchangeManager
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
+from arbitrage_bot.config.settings import config
+
+if TYPE_CHECKING:
+    from arbitrage_bot.exchange.manager import ExchangeManager
+
 
 class CostCalculator:
     """
@@ -8,6 +14,8 @@ class CostCalculator:
     """
     def __init__(self, exchange_manager: ExchangeManager):
         self.exchange_manager = exchange_manager
+        fees_config = config.get("fees", {})
+        self.default_fee_pct = fees_config.get('default_taker_fee_pct', 0.1)
         # Cache to store fee information for each exchange to avoid repeated lookups
         self.fee_cache: Dict[str, float] = {}
 
@@ -32,7 +40,7 @@ class CostCalculator:
         exchange = self.exchange_manager.get_exchange(exchange_name)
         if not exchange or not exchange.markets:
             # Fallback to a default fee if exchange data is not available
-            return 0.1 
+            return self.default_fee_pct
 
         # Find the market for the symbol to get fee info
         market = exchange.markets.get(symbol)
@@ -41,7 +49,7 @@ class CostCalculator:
             fee = market['taker'] * 100
         else:
             # Fallback for exchanges that don't specify per-market fees
-            fee = exchange.fees['trading']['taker'] * 100 if 'trading' in exchange.fees else 0.1
+            fee = exchange.fees['trading']['taker'] * 100 if 'trading' in exchange.fees else self.default_fee_pct
         
         self.fee_cache[exchange_name] = fee
         return fee

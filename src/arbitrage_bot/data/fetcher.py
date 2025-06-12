@@ -23,11 +23,16 @@ class DataFetcher:
         self._monitoring_task = None
         self._is_monitoring = False
 
-    def _get_active_symbols(self) -> Dict[str, List[str]]:
-        active_symbols = defaultdict(list)
-        for exchange_name, settings in self.exchange_manager._config.exchanges.items():
-            if settings.get('enabled', False):
-                active_symbols[exchange_name] = settings.get('symbols', [])
+    def _get_active_symbols(self) -> dict:
+        """
+        Gets a list of common symbols that are active on all enabled exchanges.
+        """
+        active_symbols = {}
+        # The structure is now self.exchange_manager.config which holds the exchanges dict
+        for exchange_name, settings in self.exchange_manager.config.items():
+            if settings.get("enabled"):
+                symbols = settings.get("symbols", [])
+                active_symbols[exchange_name] = symbols
         return active_symbols
 
     async def _watch_order_book(self, exchange_name: str, symbol: str):

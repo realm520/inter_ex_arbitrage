@@ -6,13 +6,13 @@ exchanges:
     # API credentials will be loaded from environment variables
     # e.g., BINANCE_API_KEY, BINANCE_API_SECRET
     symbols:
-      - "BTC/USDT"
+      - "CRV/USDT"
       - "ETH/USDT"
-  kraken:
+  gateio:
     enabled: true
     # e.g., KRAKEN_API_KEY, KRAKEN_API_SECRET
     symbols:
-      - "BTC/USDT"
+      - "CRV/USDT"
       - "ETH/USDT"
   # Add other exchanges here following the same structure
   # e.g., coinbasepro, bitfinex, etc.

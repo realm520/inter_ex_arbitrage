@@ -1,6 +1,6 @@
 import asyncio
 from loguru import logger
-from typing import Optional
+from typing import Optional, Self
 
 from arbitrage_bot.config.settings import config
 from arbitrage_bot.exchange.manager import ExchangeManager
@@ -29,74 +29,90 @@ class ArbitrageBot:
                                and no real orders will be executed.
         """
         self.paper_mode = paper_mode
-        self.config = config
-        self.error_handler = ErrorHandler()
-
-        self.exchange_manager = ExchangeManager(self.config, self.error_handler)
-
-        self.order_manager = OrderManager(self.exchange_manager)
-        self.risk_manager = RiskManager(self.order_manager)
-        self.data_fetcher = DataFetcher(self.exchange_manager, self.error_handler)
-        self.arbitrage_scanner = ArbitrageScanner(self.data_fetcher)
-        self.trade_executor = TradeExecutor(self.exchange_manager, self.order_manager, paper_mode=paper_mode)
-        
         self.running = False
-        self._shutting_down = False
         self._main_task: Optional[asyncio.Task] = None
+
+    @classmethod
+    async def create(cls, paper_mode: bool = False) -> Self:
+        """
+        Asynchronously creates and initializes the ArbitrageBot.
+        This is the correct way to instantiate the bot.
+        """
+        bot = cls(paper_mode)
+        
+        bot.config = config
+        bot.error_handler = ErrorHandler()
+        
+        # Initialize and connect exchanges BEFORE creating dependent components
+        bot.exchange_manager = ExchangeManager(bot.config, bot.error_handler)
+        await bot.exchange_manager.initialize_exchanges()
+
+        # Now, create components with a fully initialized exchange_manager
+        bot.order_manager = OrderManager(bot.exchange_manager)
+        bot.risk_manager = RiskManager(bot.order_manager)
+        bot.data_fetcher = DataFetcher(bot.exchange_manager, bot.error_handler)
+        bot.arbitrage_scanner = ArbitrageScanner(bot.data_fetcher, bot.exchange_manager)
+        bot.trade_executor = TradeExecutor(bot.exchange_manager, bot.order_manager, paper_mode=paper_mode)
+        
+        return bot
 
     async def run(self):
         """
-        Starts the main bot loop.
-
-        This method initializes connections, starts data monitoring, and continuously
-        scans for arbitrage opportunities.
+        Starts the main bot loop. Assumes all components are initialized.
         """
-        self.running = True
-        
-        logger.info("="*50)
-        if not self.paper_mode:
-            logger.warning("!!! REAL TRADING IS ENABLED !!!")
-            logger.warning("Bot will execute live trades on your accounts.")
-            logger.warning("Please wait 5 seconds to review your configuration or press Ctrl+C to cancel.")
-            await asyncio.sleep(5)
-        else:
-            logger.info("--- PAPER TRADING MODE ---")
-            logger.info("Bot will scan for opportunities but will NOT execute trades.")
-        logger.info("="*50)
-
-        logger.info("Initializing modules...")
-        await self.exchange_manager.initialize_exchanges()
-        
         if len(self.exchange_manager.exchanges) < 2:
             logger.error("Arbitrage requires at least two connected exchanges. Exiting.")
-            await self.shutdown()
             return
-            
-        self.data_fetcher.start_monitoring()
-        logger.info("Waiting for initial market data...")
-        await asyncio.sleep(10) # Give more time for all websockets to connect
-        logger.info("Starting arbitrage scanner...")
 
+        self.running = True
+        logger.info("=" * 50)
+        logger.info("--- PAPER TRADING MODE ---" if self.paper_mode else "--- LIVE TRADING MODE ---")
+        if not self.paper_mode:
+            logger.warning("Bot will execute live trades on your accounts.")
+        logger.info("=" * 50)
+
+        self.data_fetcher.start_monitoring()
+        
+        logger.info("Waiting 10s for initial market data to populate...")
+        await asyncio.sleep(10)
+
+        logger.info("Starting arbitrage scanner...")
         while self.running:
             try:
-                opportunities = self.arbitrage_scanner.scan()
-                
-                if opportunities:
-                    best_opportunity = opportunities[0]
-                    
-                    logger.success(f"OPPORTUNITY: Net Profit {best_opportunity.net_profit_pct:.4f}% | Buy on {best_opportunity.buy_exchange}, Sell on {best_opportunity.sell_exchange}")
+                # --- New Emergency Stop Check ---
+                if self.risk_manager.check_emergency_stop():
+                    logger.critical("EMERGENCY STOP CONDITION MET. INITIATING SHUTDOWN.")
+                    await self.trade_executor.liquidate_all_positions()
+                    await self.shutdown()
+                    break # Exit the main loop
+
+                best_opportunity = self.arbitrage_scanner.scan()
+
+                if best_opportunity:
+                    logger.success(
+                        f"OPPORTUNITY: Net Profit {best_opportunity.net_profit_pct:.4f}% | "
+                        f"Buy on {best_opportunity.buy_exchange}, Sell on {best_opportunity.sell_exchange}"
+                    )
 
                     if self.risk_manager.is_trade_safe(best_opportunity) and not self.paper_mode:
                         await self.trade_executor.execute_opportunity(best_opportunity)
-                        await asyncio.sleep(10) # Cooldown after a trade attempt
+                        
+                        # In a real scenario, PnL would be calculated based on trade execution results.
+                        # Here, we simulate a loss to test the emergency stop functionality.
+                        logger.warning("SIMULATION: Applying a -$120 PnL change to test emergency stop.")
+                        self.risk_manager.update_pnl(-120.0)
+
+                        await asyncio.sleep(10)  # Cooldown after a trade attempt
                 
-                await asyncio.sleep(1)
+                await asyncio.sleep(self.config.arbitrage.get('scan_interval_s', 5))
+
             except asyncio.CancelledError:
                 logger.info("Main loop received cancellation signal.")
-                self.running = False
+                break
             except Exception as e:
-                logger.error(f"An error occurred in the main loop: {e}", exc_info=True)
-                await asyncio.sleep(10) # Wait longer after an error
+                logger.error(f"An error occurred in the main loop: {e}")
+                logger.exception(e)
+                await asyncio.sleep(10)
 
         logger.info("Bot run loop finished.")
 
@@ -104,14 +120,15 @@ class ArbitrageBot:
         """
         Gracefully shuts down the bot and all its components.
         """
-        if self._shutting_down:
-            logger.debug("Shutdown already in progress.")
+        if not self.running:
             return
-            
-        self._shutting_down = True
-        self.running = False # Stop the main loop
-        
+
+        self.running = False
         logger.info("Cleaning up and shutting down...")
+
+        if self._main_task:
+            self._main_task.cancel()
+
         logger.debug("Calling data_fetcher.stop_monitoring()...")
         await self.data_fetcher.stop_monitoring()
         logger.debug("Finished data_fetcher.stop_monitoring().")
@@ -119,5 +136,5 @@ class ArbitrageBot:
         logger.debug("Calling exchange_manager.close_all()...")
         await self.exchange_manager.close_all()
         logger.debug("Finished exchange_manager.close_all().")
-        
+
         logger.info("Shutdown complete.") 

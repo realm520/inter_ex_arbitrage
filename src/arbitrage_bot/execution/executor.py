@@ -1,11 +1,12 @@
+from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, TYPE_CHECKING
 from loguru import logger
 
+from arbitrage_bot.model import Opportunity
 from arbitrage_bot.exchange.manager import ExchangeManager
-from arbitrage_bot.arbitrage.scanner import ArbitrageOpportunity
 from arbitrage_bot.config.settings import config
 from arbitrage_bot.execution.order_manager import OrderManager
 from arbitrage_bot.models.order import Order
@@ -15,11 +16,15 @@ class ExecutedTrade:
     """
     Represents a completed arbitrage trade, including details from both legs.
     """
-    opportunity: ArbitrageOpportunity
+    opportunity: Opportunity
     buy_order_id: str
     sell_order_id: str
     status: str  # e.g., 'completed', 'failed', 'partial'
     timestamp: float = time.time()
+
+if TYPE_CHECKING:
+    from arbitrage_bot.exchange.manager import ExchangeManager
+    from arbitrage_bot.execution.order_manager import OrderManager
 
 class TradeExecutor:
     """
@@ -33,13 +38,18 @@ class TradeExecutor:
         self.paper_mode = paper_mode
         self.max_trade_size_usd = config.arbitrage.get('max_trade_size', 100.0)
 
-    async def execute_opportunity(self, opportunity: ArbitrageOpportunity) -> Optional[Tuple[dict, dict]]:
+    async def execute_opportunity(self, opportunity: Opportunity) -> Optional[Tuple[dict, dict]]:
         """
         Executes a buy and a sell order based on the provided arbitrage opportunity.
         """
-        logger.info(f"Attempting to execute arbitrage opportunity: {opportunity.symbol}")
-        logger.info(f" -> BUY on {opportunity.buy_exchange} at ~{opportunity.buy_price}")
-        logger.info(f" -> SELL on {opportunity.sell_exchange} at ~{opportunity.sell_price}")
+        logger.info(f"Attempting to execute trade for opportunity: {opportunity.symbol} "
+                    f"| Buy on {opportunity.buy_exchange} | Sell on {opportunity.sell_exchange}")
+
+        if self.paper_mode:
+            logger.warning(f"[PAPER MODE] Skipping real execution for {opportunity.symbol}.")
+            # Log the intended trade for simulation purposes
+            self.order_manager.record_paper_trade(opportunity)
+            return
 
         buy_exchange = self.exchange_manager.get_exchange(opportunity.buy_exchange)
         sell_exchange = self.exchange_manager.get_exchange(opportunity.sell_exchange)
@@ -49,17 +59,6 @@ class TradeExecutor:
             return None
 
         try:
-            if self.paper_mode:
-                logger.info("[PAPER MODE] Skipping real order execution.")
-                logger.info(f"[PAPER] Would place BUY order: {opportunity.volume} {opportunity.base_currency} on {opportunity.buy_exchange} at ~{opportunity.buy_price}")
-                logger.info(f"[PAPER] Would place SELL order: {opportunity.volume} {opportunity.base_currency} on {opportunity.sell_exchange} at ~{opportunity.sell_price}")
-                # Simulate order creation for tracking
-                mock_buy_order = self._create_mock_order(opportunity, 'buy', opportunity.volume)
-                mock_sell_order = self._create_mock_order(opportunity, 'sell', opportunity.volume)
-                self.order_manager.add_order(mock_buy_order)
-                self.order_manager.add_order(mock_sell_order)
-                return
-
             # --- Real Order Execution ---
             logger.info(f"Placing BUY order: {opportunity.volume} {opportunity.base_currency} on {opportunity.buy_exchange}")
             buy_order = await buy_exchange.create_limit_buy_order(
@@ -88,7 +87,7 @@ class TradeExecutor:
             logger.error(f"Error executing trade for {opportunity.symbol}: {e}")
             # TODO: Implement more sophisticated error handling, e.g., cancel filled orders
             
-    def _create_mock_order(self, opportunity: ArbitrageOpportunity, side: str, amount: float) -> Order:
+    def _create_mock_order(self, opportunity: Opportunity, side: str, amount: float) -> Order:
         """Creates a mock order for paper trading."""
         return Order(
             id=f"paper-{side}-{int(time.time() * 1000)}",
@@ -102,13 +101,84 @@ class TradeExecutor:
             timestamp=int(time.time() * 1000)
         )
 
-    async def place_order(self, exchange, symbol: str, order_type: str, side: str, amount: float, price: float) -> dict:
+    async def place_order(self, exchange_name: str, symbol: str, side: str, amount: float, price: float) -> dict:
         """A wrapper for placing an order with error handling."""
+        exchange = self.exchange_manager.get_exchange(exchange_name)
+        if not exchange:
+            logger.error(f"Cannot place order: Exchange '{exchange_name}' is not available.")
+            return None
+        
         try:
             # Note: ccxt unified method is create_limit_buy_order, etc.
             # but create_order is the most general.
-            order = await exchange.create_order(symbol, order_type, side, amount, price)
+            order = await exchange.create_order(symbol, 'limit', side, amount, price)
+            logger.info(f"Placed {side} order on {exchange_name} for {amount} {symbol} @ {price}")
+            self.order_manager.record_order(order)
             return order
         except Exception as e:
-            logger.error(f"Failed to place {side} order on {exchange.id} for {symbol}: {e}")
-            raise 
+            logger.error(f"Failed to place {side} order on {exchange_name}: {e}")
+            # TODO: Implement order cancellation logic if one leg of the trade fails
+            return None 
+
+    async def liquidate_all_positions(self):
+        """
+        Connects to all exchanges, cancels all open orders, and liquidates all assets
+        to the primary quote currency (e.g., USDT).
+        """
+        logger.warning("!!! INITIATING EMERGENCY LIQUIDATION !!!")
+        quote_currencies = ['USDT', 'USD', 'BUSD', 'USDC'] # Currencies to keep
+        
+        for exchange_name, exchange in self.exchange_manager.exchanges.items():
+            try:
+                logger.info(f"--- Processing liquidation for {exchange_name} ---")
+                
+                # 1. Cancel all open orders for this exchange
+                logger.info(f"Cancelling all open orders on {exchange_name}...")
+                # In a real scenario, a more robust implementation would fetch open orders 
+                # and cancel them one by one, as `cancel_all_orders` is not universally supported.
+                if 'cancelAllOrders' in exchange.has and exchange.has['cancelAllOrders']:
+                    await exchange.cancel_all_orders()
+                else:
+                    logger.warning(f"Exchange {exchange_name} does not support cancel_all_orders. Manual cancellation may be needed.")
+
+                # 2. Fetch current balances
+                balance = await exchange.fetch_balance()
+                
+                # 3. Find assets to liquidate
+                assets_to_liquidate = []
+                for currency, amount in balance['total'].items():
+                    # Only consider assets with a meaningful amount
+                    if amount > 0 and currency not in quote_currencies:
+                        assets_to_liquidate.append((currency, amount))
+                
+                if not assets_to_liquidate:
+                    logger.info(f"No assets to liquidate on {exchange_name}.")
+                    continue
+                
+                logger.warning(f"Found assets to liquidate on {exchange_name}: {assets_to_liquidate}")
+
+                # 4. Liquidate each asset
+                for currency, amount in assets_to_liquidate:
+                    # Find a market to sell this currency for a quote currency
+                    market_symbol = None
+                    for quote in quote_currencies:
+                        symbol = f"{currency}/{quote}"
+                        if symbol in exchange.markets:
+                            market_symbol = symbol
+                            break
+                    
+                    if not market_symbol:
+                        logger.error(f"Could not find a market to sell {currency} on {exchange_name}. Manual intervention required.")
+                        continue
+                        
+                    # Place a market sell order
+                    logger.warning(f"Placing MARKET SELL order for {amount} {currency} on {exchange_name} via {market_symbol}")
+                    if not self.paper_mode:
+                        await exchange.create_market_sell_order(market_symbol, amount)
+                    else:
+                        logger.info(f"[PAPER MODE] Skipping MARKET SELL for {amount} {currency} on {exchange_name}")
+
+            except Exception as e:
+                logger.critical(f"An error occurred during liquidation on {exchange_name}: {e}. Manual intervention may be required!")
+
+        logger.critical("!!! EMERGENCY LIQUIDATION COMPLETE !!!") 
