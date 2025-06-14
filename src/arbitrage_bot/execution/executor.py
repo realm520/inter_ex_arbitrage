@@ -38,9 +38,10 @@ class TradeExecutor:
         self.paper_mode = paper_mode
         self.max_trade_size_usd = config.arbitrage.get('max_trade_size', 100.0)
 
-    async def execute_opportunity(self, opportunity: Opportunity) -> Optional[Tuple[dict, dict]]:
+    async def execute_opportunity(self, opportunity: Opportunity) -> Dict[str, any]:
         """
         Executes a buy and a sell order based on the provided arbitrage opportunity.
+        Returns a dictionary with execution results.
         """
         logger.info(f"Attempting to execute trade for opportunity: {opportunity.symbol} "
                     f"| Buy on {opportunity.buy_exchange} | Sell on {opportunity.sell_exchange}")
@@ -49,14 +50,28 @@ class TradeExecutor:
             logger.warning(f"[PAPER MODE] Skipping real execution for {opportunity.symbol}.")
             # Log the intended trade for simulation purposes
             self.order_manager.record_paper_trade(opportunity)
-            return
+            return {
+                'success': True,
+                'paper_mode': True,
+                'buy_order': None,
+                'sell_order': None,
+                'message': 'Paper trade recorded'
+            }
 
         buy_exchange = self.exchange_manager.get_exchange(opportunity.buy_exchange)
         sell_exchange = self.exchange_manager.get_exchange(opportunity.sell_exchange)
 
         if not buy_exchange or not sell_exchange:
             logger.error("Could not get exchange instances for trade execution.")
-            return None
+            return {
+                'success': False,
+                'error': 'Exchange instances not available',
+                'buy_order': None,
+                'sell_order': None
+            }
+
+        buy_order = None
+        sell_order = None
 
         try:
             # --- Real Order Execution ---
@@ -73,19 +88,77 @@ class TradeExecutor:
             logger.success(f"Successfully placed SELL order on {opportunity.sell_exchange}. Order ID: {sell_order['id']}")
 
             if buy_order and sell_order:
-                return buy_order, sell_order
+                return {
+                    'success': True,
+                    'buy_order': buy_order,
+                    'sell_order': sell_order,
+                    'message': 'Both orders executed successfully'
+                }
             
-            # TODO: Add logic to handle partial execution (e.g., cancel the successful order)
+            # Handle partial execution
             if buy_order and not sell_order:
-                logger.warning(f"Only BUY order was successful. Manual intervention may be required for order {buy_order['id']}.")
+                logger.warning(f"Only BUY order was successful. Attempting to cancel order {buy_order['id']}.")
+                await self._handle_partial_execution(buy_exchange, buy_order, 'buy')
+                return {
+                    'success': False,
+                    'error': 'Partial execution - buy order placed but sell order failed',
+                    'buy_order': buy_order,
+                    'sell_order': None
+                }
             
             if sell_order and not buy_order:
-                logger.warning(f"Only SELL order was successful. Manual intervention may be required for order {sell_order['id']}.")
+                logger.warning(f"Only SELL order was successful. Attempting to cancel order {sell_order['id']}.")
+                await self._handle_partial_execution(sell_exchange, sell_order, 'sell')
+                return {
+                    'success': False,
+                    'error': 'Partial execution - sell order placed but buy order failed',
+                    'buy_order': None,
+                    'sell_order': sell_order
+                }
 
-            return None
+            return {
+                'success': False,
+                'error': 'Both orders failed',
+                'buy_order': None,
+                'sell_order': None
+            }
         except Exception as e:
             logger.error(f"Error executing trade for {opportunity.symbol}: {e}")
-            # TODO: Implement more sophisticated error handling, e.g., cancel filled orders
+            
+            # Attempt to clean up any successful orders
+            if buy_order:
+                await self._handle_partial_execution(buy_exchange, buy_order, 'buy')
+            if sell_order:
+                await self._handle_partial_execution(sell_exchange, sell_order, 'sell')
+                
+            return {
+                'success': False,
+                'error': f'Execution failed: {str(e)}',
+                'buy_order': buy_order,
+                'sell_order': sell_order
+            }
+
+    async def _handle_partial_execution(self, exchange, order: dict, side: str):
+        """
+        Handles partial execution by attempting to cancel the successful order.
+        This prevents leaving unhedged positions.
+        """
+        try:
+            logger.warning(f"Attempting to cancel {side} order {order['id']} due to partial execution")
+            cancelled_order = await exchange.cancel_order(order['id'], order['symbol'])
+            
+            if cancelled_order['status'] == 'canceled':
+                logger.success(f"Successfully cancelled {side} order {order['id']}")
+                self.order_manager.update_order_status(order['id'], 'canceled')
+            else:
+                logger.warning(f"Order {order['id']} could not be cancelled - it may have been filled. Status: {cancelled_order['status']}")
+                # If the order was filled, we need to handle the position
+                if cancelled_order['status'] == 'closed':
+                    logger.critical(f"Order {order['id']} was filled! Manual intervention required to hedge position.")
+                    
+        except Exception as e:
+            logger.error(f"Failed to cancel {side} order {order['id']}: {e}")
+            logger.critical(f"Manual intervention required for order {order['id']}")
             
     def _create_mock_order(self, opportunity: Opportunity, side: str, amount: float) -> Order:
         """Creates a mock order for paper trading."""

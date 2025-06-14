@@ -6,14 +6,36 @@ exchanges:
     # API credentials will be loaded from environment variables
     # e.g., BINANCE_API_KEY, BINANCE_API_SECRET
     symbols:
+      # Original pairs
       - "CRV/USDT"
-      - "ETH/USDT"
+      - "TRB/USDT"
+      # High-opportunity pairs (small/medium cap)
+      - "PEPE/USDT"    # Meme coin with high volatility
+      - "1INCH/USDT"   # DEX aggregator token
+      - "UNI/USDT"     # Uniswap token
+      # - "MATIC/USDT"   # Polygon Layer2
+      - "LINK/USDT"    # Chainlink oracle
+      - "DOGE/USDT"    # Popular meme coin
+      # Lower priority but stable
+      - "ADA/USDT"     # Cardano
+      - "DOT/USDT"     # Polkadot
   gateio:
     enabled: true
-    # e.g., KRAKEN_API_KEY, KRAKEN_API_SECRET
+    # e.g., GATEIO_API_KEY, GATEIO_API_SECRET
     symbols:
+      # Original pairs
       - "CRV/USDT"
-      - "ETH/USDT"
+      - "TRB/USDT"
+      # High-opportunity pairs
+      - "PEPE/USDT"
+      - "1INCH/USDT"
+      - "UNI/USDT"
+      # - "MATIC/USDT"
+      - "LINK/USDT"
+      - "DOGE/USDT"
+      # Lower priority
+      - "ADA/USDT"
+      - "DOT/USDT"
   # Add other exchanges here following the same structure
   # e.g., coinbasepro, bitfinex, etc.
 
@@ -26,17 +48,21 @@ arbitrage:
   
   # The maximum slippage percentage allowed when executing orders
   max_slippage: 0.1
-
-risk:
-  # An overall stop-loss limit in USDT. The bot will stop if total losses exceed this.
-  emergency_stop_loss: 500.0
   
-  # The maximum number of concurrent open trades
-  max_open_trades: 3
+  # Event-driven scanning configuration
+  scan_cooldown_ms: 500  # Minimum milliseconds between scans to avoid spam
+  
+  # Legacy polling interval (only used for emergency stop checks now)
+  scan_interval_s: 30
 
 risk_management:
+  # The maximum number of concurrent open trades
   max_open_trades: 5
+  
+  # Emergency stop-loss percentage (will trigger when PnL drops below this percentage)
   emergency_stop_loss_pct: 10.0
+  
+  # File to store PnL tracking data
   pnl_file: "pnl_report.json"
 
 logging:

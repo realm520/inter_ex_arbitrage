@@ -91,4 +91,27 @@ class OrderManager:
         logger.info(f"Now managing order {order.id} on {order.exchange_name} ({order.status.value}).")
 
     def get_order(self, order_id: str) -> Optional[Order]:
-        return self.orders.get(order_id) 
+        return self.orders.get(order_id)
+    
+    def get_open_order_count(self) -> int:
+        """Returns the number of open (non-closed) orders."""
+        open_count = 0
+        for order in self.orders.values():
+            if order.status not in [OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.FAILED]:
+                open_count += 1
+        return open_count
+    
+    def record_paper_trade(self, opportunity):
+        """Records a paper trade for simulation purposes."""
+        logger.info(f"[PAPER TRADE] Would execute {opportunity.symbol}: "
+                   f"Buy {opportunity.volume} on {opportunity.buy_exchange} @ {opportunity.buy_price}, "
+                   f"Sell {opportunity.volume} on {opportunity.sell_exchange} @ {opportunity.sell_price}")
+    
+    def update_order_status(self, order_id: str, status: str):
+        """Updates an order's status manually."""
+        if order_id in self.orders:
+            old_status = self.orders[order_id].status
+            self.orders[order_id].status = OrderStatus(status)
+            logger.info(f"Order {order_id} status updated: {old_status.value} -> {status}")
+        else:
+            logger.warning(f"Cannot update status for unknown order ID: {order_id}") 

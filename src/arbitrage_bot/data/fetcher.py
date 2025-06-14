@@ -1,8 +1,9 @@
 import asyncio
 import ccxt.pro
 from loguru import logger
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Callable, Optional
 from collections import defaultdict
+import time
 
 from arbitrage_bot.exchange.manager import ExchangeManager
 from arbitrage_bot.utils.error_handler import ErrorHandler
@@ -22,6 +23,21 @@ class DataFetcher:
         self.active_symbols = self._get_active_symbols()
         self._monitoring_task = None
         self._is_monitoring = False
+        
+        # Event-driven architecture
+        self._scan_callback: Optional[Callable[[str], Any]] = None
+        self._last_scan_time = 0
+        # Get scan cooldown from config (convert ms to seconds)
+        from arbitrage_bot.config.settings import config
+        cooldown_ms = config.arbitrage.get('scan_cooldown_ms', 500)
+        self._scan_cooldown = cooldown_ms / 1000.0  # Convert to seconds
+        self._pending_symbols = set()  # Symbols that need scanning
+        
+        # Heartbeat and activity tracking
+        self._last_heartbeat = 0
+        self._heartbeat_interval = 30  # seconds
+        self._update_counts = defaultdict(int)  # Track updates per symbol
+        self._level1_change_counts = defaultdict(int)  # Track Level 1 changes per symbol
 
     def _get_active_symbols(self) -> dict:
         """
@@ -35,6 +51,92 @@ class DataFetcher:
                 active_symbols[exchange_name] = symbols
         return active_symbols
 
+    def register_scan_callback(self, callback: Callable[[str], Any]):
+        """
+        Register a callback function that will be called when order book changes
+        should trigger a scan for the given symbol.
+        """
+        self._scan_callback = callback
+        logger.info("Registered scan callback for event-driven arbitrage scanning")
+
+    def _has_level1_changed(self, old_book: Dict[str, Any], new_book: Dict[str, Any]) -> bool:
+        """
+        Check if Level 1 data (best bid/ask) has changed significantly.
+        """
+        if not old_book or not new_book:
+            return True  # First update or missing data
+            
+        # Check if best bid or ask has changed
+        old_best_bid = old_book.get('bids', [[None]])[0][0] if old_book.get('bids') else None
+        new_best_bid = new_book.get('bids', [[None]])[0][0] if new_book.get('bids') else None
+        
+        old_best_ask = old_book.get('asks', [[None]])[0][0] if old_book.get('asks') else None
+        new_best_ask = new_book.get('asks', [[None]])[0][0] if new_book.get('asks') else None
+        
+        return (old_best_bid != new_best_bid) or (old_best_ask != new_best_ask)
+
+    async def _trigger_scan_if_needed(self, symbol: str):
+        """
+        Trigger scan callback if conditions are met and cooldown has passed.
+        """
+        if not self._scan_callback:
+            return
+            
+        current_time = time.time()
+        
+        # Add symbol to pending list
+        self._pending_symbols.add(symbol)
+        
+        # Check cooldown
+        if current_time - self._last_scan_time < self._scan_cooldown:
+            return  # Wait for cooldown
+            
+        # Trigger scan for all pending symbols
+        if self._pending_symbols:
+            pending_count = len(self._pending_symbols)
+            logger.trace(f"Triggering scan for {pending_count} symbols: {self._pending_symbols}")
+            
+            # Call the scan callback (non-blocking)
+            try:
+                # Create a task to run the callback without blocking WebSocket updates
+                asyncio.create_task(self._run_scan_callback())
+                self._last_scan_time = current_time
+                self._pending_symbols.clear()
+                logger.trace(f"Scan task created successfully")
+            except Exception as e:
+                logger.error(f"Error triggering scan callback: {e}")
+                
+    async def _run_scan_callback(self):
+        """
+        Run the scan callback in a separate task to avoid blocking WebSocket updates.
+        """
+        try:
+            if self._scan_callback:
+                await self._scan_callback()
+        except Exception as e:
+            logger.error(f"Error in scan callback: {e}")
+
+    def _log_heartbeat(self):
+        """
+        Log periodic heartbeat to show the system is alive and working.
+        """
+        current_time = time.time()
+        if current_time - self._last_heartbeat >= self._heartbeat_interval:
+            total_updates = sum(self._update_counts.values())
+            total_level1_changes = sum(self._level1_change_counts.values())
+            
+            logger.info(f"[HEARTBEAT] WebSocket active - "
+                       f"Total updates: {total_updates}, "
+                       f"Level 1 changes: {total_level1_changes}, "
+                       f"Monitoring {len(self.active_symbols)} exchanges")
+            
+            # Log detailed stats if there's activity
+            if total_updates > 0:
+                logger.debug(f"[ACTIVITY] Update stats: {dict(self._update_counts)}")
+                logger.debug(f"[ACTIVITY] Level 1 change stats: {dict(self._level1_change_counts)}")
+            
+            self._last_heartbeat = current_time
+
     async def _watch_order_book(self, exchange_name: str, symbol: str):
         exchange = self.exchange_manager.exchanges[exchange_name]
         logger.info(f"Subscribing to order book for {symbol} on {exchange_name}")
@@ -47,9 +149,33 @@ class DataFetcher:
                 continue
 
             try:
-                order_book = await exchange.watch_order_book(symbol)
-                self._order_books[exchange_name][symbol] = order_book
-                logger.trace(f"Received order book update for {symbol} on {exchange_name}")
+                # Store old order book for comparison
+                old_order_book = self._order_books[exchange_name].get(symbol)
+                
+                # Get new order book
+                new_order_book = await exchange.watch_order_book(symbol)
+                
+                # Check if Level 1 data has changed
+                level1_changed = self._has_level1_changed(old_order_book, new_order_book)
+                
+                # Update stored order book
+                self._order_books[exchange_name][symbol] = new_order_book
+                
+                # Track activity stats
+                symbol_key = f"{exchange_name}:{symbol}"
+                self._update_counts[symbol_key] += 1
+                
+                if level1_changed:
+                    self._level1_change_counts[symbol_key] += 1
+                    logger.trace(f"Level 1 change detected for {symbol} on {exchange_name}")
+                    # Trigger scan asynchronously
+                    await self._trigger_scan_if_needed(symbol)
+                else:
+                    logger.trace(f"Order book update (no Level 1 change) for {symbol} on {exchange_name}")
+                
+                # Log periodic heartbeat
+                self._log_heartbeat()
+                
                 self.error_handler.reset_error(component_id) # Reset on success
             except Exception as e:
                 logger.error(f"Error watching order book for {symbol} on {exchange_name}: {e}")
@@ -65,12 +191,15 @@ class DataFetcher:
 
         self._is_monitoring = True
         tasks = []
+        total_streams = 0
         for exchange_name, symbols in self.active_symbols.items():
             for symbol in symbols:
                 tasks.append(self._watch_order_book(exchange_name, symbol))
+                total_streams += 1
         
         self._monitoring_task = asyncio.gather(*tasks)
-        logger.info("Started data fetcher monitoring.")
+        logger.info(f"Started data fetcher monitoring for {total_streams} WebSocket streams across {len(self.active_symbols)} exchanges")
+        logger.info(f"Heartbeat interval: {self._heartbeat_interval}s, Scan cooldown: {self._scan_cooldown}s")
 
     async def stop_monitoring(self):
         """Stops the monitoring task gracefully."""

@@ -19,19 +19,31 @@ class RiskManager:
     """
     def __init__(self, order_manager: OrderManager):
         self.order_manager = order_manager
-        # TODO: Load these from config
-        self.max_open_trades = 5
-        self.emergency_stop_loss_usd = 100.0 # Emergency stop if total PnL drops below this (in USD)
-        self.pnl = 0.0 # Placeholder for Profit and Loss tracking
+        
+        # Load configuration from config
+        self.max_open_trades = config.risk_management.get('max_open_trades', 5)
+        self.emergency_stop_loss_usd = config.risk_management.get('emergency_stop_loss_pct', 10.0) * 10  # Convert percentage to USD
+        
+        # Initialize PnL file path
+        self.pnl_file = Path(config.risk_management.get('pnl_file', 'pnl_report.json'))
+        
+        # Load existing PnL or start with 0.0
+        self.pnl = self._load_pnl()
+        
+        # Initialize trading state
+        self.trading_enabled = True
+        
         logger.info("Risk Manager initialized.")
         logger.info(f" - Max open trades: {self.max_open_trades}")
         logger.info(f" - Emergency stop-loss threshold: -${self.emergency_stop_loss_usd:.2f}")
+        logger.info(f" - PnL file: {self.pnl_file}")
         logger.info(f" - Initial PnL loaded: ${self.pnl:.2f}")
 
     def update_pnl(self, pnl_change: float):
         """Updates the portfolio's PnL. For simulation and future use."""
         self.pnl += pnl_change
         logger.info(f"PnL updated by ${pnl_change:.2f}. Current PnL: ${self.pnl:.2f}")
+        self._save_pnl()
 
     def check_emergency_stop(self) -> bool:
         """Checks if the emergency stop-loss has been triggered."""
@@ -61,7 +73,7 @@ class RiskManager:
         logger.info(f"Risk Check PASSED for opportunity: {opportunity.symbol}")
         return True
     
-    def update_pnl(self, buy_order: Order, sell_order: Order):
+    def update_pnl_from_orders(self, buy_order: Order, sell_order: Order):
         """
         Updates the total Profit and Loss after a trade is completed.
         This is a simplified PnL calculation.
